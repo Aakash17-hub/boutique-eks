@@ -1,265 +1,154 @@
-# ShopSphere
+# Online Boutique on AWS EKS with a Self-Hosted CI/CD Pipeline
 
-A hands-on Kubernetes project: Google's **Online Boutique** (11 microservices) running on **Minikube on an AWS EC2 instance**, with hand-written manifests, per-service RBAC, default-deny NetworkPolicies and a **GitLab CI/CD** pipeline that validates and deploys from git.
-
-The goal was not just to get the demo running, but to write every manifest myself, break things on purpose, and document what I learned.
-
-> The application itself is [GoogleCloudPlatform/microservices-demo](https://github.com/GoogleCloudPlatform/microservices-demo) (Apache 2.0), image version `v0.10.7`. The original release manifest is kept unchanged in `upstream/` for reference. Everything in `k8s/`, `bootstrap/` and `.gitlab-ci.yml` is my own work.
-
----
+A hands-on cloud/DevOps project: a self-hosted **GitLab -> Jenkins -> Amazon ECR -> Amazon EKS** pipeline that builds and deploys the Google *Online Boutique* microservices demo, with a least-privilege deploy role and automatic rollback when a rollout fails.
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    laptop["Developer laptop"]
-    bastion["Bastion EC2<br/>Public subnet"]
-    subgraph AWS["AWS environment"]
-        subgraph PUBLIC["Public subnet"]
-            mini["ShopSphere Minikube EC2<br/>Ubuntu 24.04 · Docker driver<br/>GitLab Runner · shell executor"]
-        end
-        subgraph PRIVATE["Private subnet"]
-            gitlab["GitLab EC2<br/>Repository · CI/CD pipelines"]
-        end
-    end
-
-    laptop -->|"SSH ProxyJump"| bastion
-    bastion -->|"SSH"| mini
-    mini -->|"Runner polls GitLab for jobs"| gitlab
-    gitlab -.->|"Pipeline triggers job execution on runner"| mini
-    mini --> workloads["Kubernetes namespace: shopsphere<br/>11 application workloads"]
-
-    classDef host fill:#eaf3ff,stroke:#3777b8,color:#17365d
-    classDef service fill:#eaf8ef,stroke:#27834a,color:#174d2a
-    class laptop,bastion,mini,gitlab host
-    class workloads service
+```
+Developer --push--> GitLab (EC2, private subnet)
+                        |
+                        v
+                  Jenkins (EC2, private subnet)
+                  |- docker build
+                  |- push image --> Amazon ECR
+                  |- kubectl set image --> Amazon EKS (eks-lab, namespace: boutique)
+                  |- kubectl rollout status
+                  `- kubectl rollout undo (if the rollout fails)
+                                              `-- 11 microservices + Redis
 ```
 
-- The Minikube host has its own security group. Inbound is **SSH only, from the bastion's security group**. Nothing else is exposed.
-- The frontend Service is `ClusterIP`. I reach it with `kubectl port-forward` through an SSH tunnel, so there is no public load balancer.
-- The Minikube host sits in a public subnet so it can pull images without a NAT gateway (a NAT gateway is the most expensive idle resource in this setup).
-- Host: Ubuntu 24.04 on `m7i-flex.large` (2 vCPU, 8 GiB), 40 GB gp3, 4 GB swap. Minikube runs with `--driver=docker --cpus=2 --memory=6144`.
+- **Trigger:** builds are started manually from Jenkins (`Build with Parameters`); a GitLab webhook is a planned next step.
+- **Access:** bastion host + SSH tunnels (no public access to GitLab or Jenkins).
+- **Jenkins -> AWS:** EC2 instance role (`jenkins-ec2-role`), no stored AWS keys.
+- **Jenkins -> EKS:** EKS access entry plus a namespace-scoped Kubernetes `Role` (`jenkins-deployment-rbac.yaml`). Jenkins can only read, list, watch and patch the `frontend` and `cartservice` deployments in the `boutique` namespace, and read ReplicaSets (needed for rollback). It cannot create namespaces or touch other workloads.
+- **Cluster:** created from a single config file (`eks-lab.yaml`) with `eksctl`, one `m7i-flex.large` node.
+- **Exposure:** all Services are `ClusterIP`. There is no public load balancer; the shop is reached with `kubectl port-forward`.
+- **Hardening in the manifests:** readiness and liveness probes and resource limits on the workloads.
 
-### Service call graph
+## Tech stack
 
-```mermaid
-flowchart LR
-  user([Browser via SSH tunnel]) --> frontend
-  frontend --> productcatalogservice
-  frontend --> currencyservice
-  frontend --> cartservice
-  frontend --> shippingservice
-  frontend --> recommendationservice
-  frontend --> checkoutservice
-  frontend --> adservice
-  recommendationservice --> productcatalogservice
-  checkoutservice --> productcatalogservice
-  checkoutservice --> currencyservice
-  checkoutservice --> cartservice
-  checkoutservice --> shippingservice
-  checkoutservice --> paymentservice
-  checkoutservice --> emailservice
-  cartservice --> redis-cart
-```
-
-### Ports
-
-| Service | Container port | Service port |
-|---|---|---|
-| frontend | 8080 | 80 |
-| productcatalogservice | 3550 | 3550 |
-| currencyservice | 7000 | 7000 |
-| cartservice | 7070 | 7070 |
-| shippingservice | 50051 | 50051 |
-| paymentservice | 50051 | 50051 |
-| emailservice | **8080** | **5000** |
-| recommendationservice | 8080 | 8080 |
-| checkoutservice | 5050 | 5050 |
-| adservice | 9555 | 9555 |
-| redis-cart | 6379 | 6379 |
-
-The load generator from the upstream demo is intentionally not deployed (the node only has 2 vCPUs).
-
----
+AWS (EKS, ECR, EC2, VPC, NAT Gateway, IAM, CloudFormation), Kubernetes (RBAC, namespaces, probes), Docker, Jenkins (declarative pipeline), GitLab, eksctl, kubectl, Linux.
 
 ## Repository layout
 
-```
-.
-├── upstream/                 # original Online Boutique release manifest (unchanged)
-├── k8s/                      # my manifests, applied by CI
-│   ├── 00-namespace.yaml
-│   ├── 01-rbac.yaml          # ServiceAccounts, read-only Role
-│   ├── 02-networkpolicies.yaml
-│   └── <service>.yaml        # one Deployment + Service per service (11 files)
-├── bootstrap/
-│   └── ci-deployer.yaml      # least-privilege identity for CI (applied by hand, NOT by CI)
-├── docs/                     # screenshots and notes
-└── .gitlab-ci.yml
-```
+| Path | Purpose |
+|---|---|
+| `Jenkinsfile` | Pipeline: ECR login, build and push, optional deploy to EKS with auto-rollback |
+| `eks-lab.yaml` | `eksctl` cluster definition (infrastructure as code) |
+| `namespace.yaml` | Creates the `boutique` namespace |
+| `jenkins-deployment-rbac.yaml` | Least-privilege Role and RoleBinding for Jenkins |
+| `kubernetes-manifests.yaml` | Online Boutique manifests (ClusterIP services, probes, limits) |
+| `frontend/`, `cartservice/` | Application source built by the pipeline |
+| `docs/screenshots/` | Proof of the working pipeline |
+| `LICENSE` | Apache 2.0 |
 
----
+## Pipeline
 
-## What is implemented
+The Jenkins job takes three parameters: `SERVICE` (`frontend`, `cartservice` or `both`), `DEPLOY` (true/false) and an optional `IMAGE_TAG`.
 
-### 1. Manifests (`k8s/`)
+1. **Checkout** from GitLab
+2. **ECR Login** using the instance role
+3. **Build and Push** the image, tagged with the build number and `latest`
+4. **Deploy to EKS** (only when `DEPLOY` is true):
+   - `kubectl -n boutique set image` with the new tag (or `IMAGE_TAG` if given)
+   - `kubectl rollout status` with a 180 second timeout
+   - if the rollout does not finish, `kubectl rollout undo`, wait for the old version to be healthy again, then fail the build
 
-- One namespace, `shopsphere`. Every object carries `app` and `app.kubernetes.io/part-of` labels.
-- **Probes** on every workload: gRPC probes for the gRPC services, an HTTP probe on `/_healthz` for the frontend, and a TCP readiness plus `redis-cli ping` liveness probe for Redis.
-- **Requests and limits** chosen from real usage (`kubectl top`), not copied blindly:
+## Auto-rollback demo
 
-| Workload | CPU request / limit | Memory request / limit |
-|---|---|---|
-| most gRPC services (currency, productcatalog, shipping, payment, email, checkout) | 20m / 200m | 32Mi / 128Mi |
-| cartservice | 30m / 200m | 48Mi / 128Mi |
-| frontend | 20m / 200m | 64Mi / 128Mi |
-| recommendationservice | 30m / 200m | 128Mi / 450Mi |
-| adservice (JVM, slower start) | 20m / 300m | 128Mi / 300Mi |
-| redis-cart | 20m / 100m | 32Mi / 128Mi |
+To prove the rollback path, I deployed a tag that does not exist (`IMAGE_TAG=doesnotexist`):
 
-### 2. RBAC
+1. Jenkins set the frontend image to the missing tag.
+2. The new pod could not pull its image, so the rollout timed out after 180 seconds.
+3. The pipeline ran `rollout undo`, the previous revision became healthy again, and the build finished as FAILURE with the message that the deploy was rolled back.
+4. Throughout, the old pod kept running, so there was no visible downtime. The deployment history shows the failed revision and the rollback to the working image.
 
-- Every service has its **own ServiceAccount** with `automountServiceAccountToken: false`. None of these services talks to the Kubernetes API, so no token is mounted into the pods.
-- `ops-viewer`: a namespaced, read-only Role (get/list/watch on pods, pod logs, services, deployments) with a RoleBinding. It cannot delete anything or read secrets.
+## Screenshots
 
-### 3. NetworkPolicies
+**Jenkins build history**: green deploy, then the intentional rollback demo
+![Jenkins pipeline](docs/screenshots/01-jenkins-pipeline-success.png)
 
-- `default-deny-ingress` applies to pods across the namespace. The file defines 11 destination-specific allow policies: 10 service-to-service rules and one frontend ingress rule. The frontend rule allows traffic to pod port 8080 without a source-selector restriction.
-- Rules use container ports, not Service ports (this matters for `emailservice`).
-- Ingress is restricted by policy rules; egress is not restricted yet (see Limitations).
-- Enforcement was verified on the original Minikube profile (default `kindnet` CNI, image `kindest/kindnetd:v20260820-69b56db7`). In a throwaway namespace, a deny-all policy turned a working request into a timeout. In `shopsphere`, a test pod without a permitted label could not reach `paymentservice`, while a pod labelled `app=checkoutservice` could. This covers the tested paths only, not every rule or egress behaviour.
+**Namespace, pods and ClusterIP services**
+![Pods running on EKS](docs/screenshots/02-eks-pods-running.png)
 
-### 4. CI/CD (GitLab CI)
+**Image pushed to and pulled from ECR**
+![Image in ECR](docs/screenshots/03-ecr-image-pushed-and-pulled.png)
 
-A shell runner on the Minikube host runs two stages:
+**Order completed in the shop** (via port-forward)
+![Order completed in the shop](docs/screenshots/04-boutique-order-complete.png)
 
-| Stage | What it does | When |
-|---|---|---|
-| `validate` | `kubectl apply --dry-run=server` on all manifests | every push |
-| `deploy` | `kubectl apply`, then `kubectl rollout status` for every deployment | `main` branch only |
+**Jenkins deploy stage** (`set image` and `rollout status` in the `boutique` namespace)
+![Jenkins deploy stage](docs/screenshots/05-jenkins-console-deploy-stage.png)
 
-The pipeline does **not** use an admin kubeconfig. It uses a dedicated `ci-deployer` ServiceAccount whose Role can create/update/patch deployments, services, service accounts and network policies in `shopsphere`, and nothing else. It cannot delete, cannot read secrets, cannot touch RBAC objects and cannot reach other namespaces. For that reason the pipeline skips `00-namespace.yaml` and `01-rbac.yaml`; those are applied by an admin.
+**GitLab repository**
+![GitLab repository](docs/screenshots/06-gitlab-repo.png)
 
-**Demo:** changing `replicas: 1` to `replicas: 2` in `k8s/frontend.yaml` and pushing created a second frontend pod with no manual `kubectl apply`. Pushing `replicas: 1` scaled it back. Rollback is a git commit.
+**Rollback demo**: failed rollout, `rollout undo`, build marked failed
+![Rollback demo](docs/screenshots/07-rollback-demo.png)
 
-### CI/CD evidence
-
-The screenshots below are historical examples from pipeline #12, showing the validation and frontend scale-up demonstration. They are not screenshots of the latest pipeline.
-
-![Pipeline history](docs/screenshots/ci-pipelines-history.png)
-*Historical pipeline list: pipelines #9–#11 failed due to the YAML parsing issue documented below; #12 and #13 passed at the time of capture.*
-
-![Validate job](docs/screenshots/ci-validate-12.png)
-*Historical validation job: server-side dry run reports the planned frontend change.*
-
-![Deploy job](docs/screenshots/ci-deploy-12-scale-up.png)
-*Historical deploy job: the frontend rollout waits for the second replica and succeeds.*
-
-**Latest recorded verification:** commit `cbac4b1` (`docs: improve NetworkPolicy verification and setup guide`) passed the GitLab validation and deployment stages. The deploy job applied the manifests and all 11 application deployments rolled out successfully. Capture a fresh GitLab pipeline screenshot if you want visual evidence of this latest run.
-
----
-
-## Verification
-
-| Check | Evidence / command | Result |
-|---|---|---|
-| Application health | `kubectl get pods -n shopsphere` on the original `minikube` profile | All 11 application pods were `1/1 Running` in the latest health check; historical synchronized restarts were observed and the exact root cause was not confirmed |
-| Deployment rollout | `kubectl rollout status` for each deployment | All 11 deployments successfully rolled out |
-| Frontend HTTP response | `curl -I http://127.0.0.1:8080` while forwarding `svc/frontend` port 80 to local port 8080 | `HTTP/1.1 200 OK` |
-| End to end | Add an item to the cart and place a test order through the browser | Successfully completed in the latest smoke test; order flow reached completion |
-| `ops-viewer` rights | `kubectl auth can-i list pods -n shopsphere --as=system:serviceaccount:shopsphere:ops-viewer` | `yes` (previously tested) |
-| `ops-viewer` limits | Same check with `delete pods`, `get secrets`, or namespace `default` | `no` (previously tested) |
-| `ci-deployer` rights and limits | `kubectl auth can-i` checks using its kubeconfig | Previously tested; the pipeline also successfully completed validate and deploy stages |
-| NetworkPolicy enforcement | Separate `netpol-test` Minikube profile with Calico; temporary test pods used source labels `app=checkoutservice`, `app=cartservice`, and `app=netpol-test` | Three allowed paths succeeded and three denied paths timed out. Calico version was not captured. |
-
-### NetworkPolicy test details
-
-The Calico test was performed on the separate `netpol-test` profile, not the original `minikube` profile. The test pods were deleted afterward and the `netpol-test` profile was stopped. The Calico version was not recorded.
-
-| Destination | Permitted test pod | Denied test pod | Result |
-|---|---|---|---|
-| `paymentservice:50051` | `netpol-allow-checkout` (`app=checkoutservice`) — connection open | `netpol-deny` (`app=netpol-test`) — connection timed out | Pass |
-| `emailservice:5000` | `netpol-allow-checkout` (`app=checkoutservice`) — connection open | `netpol-deny` (`app=netpol-test`) — connection timed out | Pass |
-| `redis-cart:6379` | `netpol-allow-cart` (`app=cartservice`) — connection open | `netpol-deny` (`app=netpol-test`) — connection timed out | Pass |
-
-These tests verify the three listed traffic paths only. They do not prove every NetworkPolicy rule or egress behavior. The original cluster and the Calico test cluster are separate; do not infer Calico enforcement on the original profile from these tests.
-
----
-
-## Lessons and troubleshooting log
-
-**Pods stuck in `Pending` while the node was almost idle.** The events said `Insufficient cpu`. The scheduler works with CPU *requests*, which were at 97% of the node, while real usage was around 7%. Fix: set requests from `kubectl top` measurements.
-
-**Service port vs container port (emailservice).** `checkoutservice` calls `emailservice:5000`, which is the Kubernetes Service port; the emailservice container listens on port 8080. Keep the distinction clear when debugging connectivity: clients address the Service port, while NetworkPolicy rules are evaluated against traffic to the destination pod port. The Calico test connected through the `emailservice:5000` Service port; NetworkPolicy evaluates traffic at the destination pod port, 8080.
-
-**A passing readiness probe does not mean healthy dependencies.** I set `REDIS_ADDR=wrong-host:6379` on `cartservice`. The new pod still became Ready, because its probe only checks that the process is alive, and the rolling update replaced the good pod with the broken one. Mitigations: dependency-aware probes, and monitoring/alerting (planned).
-
-**NetworkPolicy selects pods by labels, not by workload identity.** On the Calico test profile, a test pod labelled `app=checkoutservice` was permitted to reach `paymentservice`. A principal allowed to create pods in the namespace may be able to assign a permitted label, so RBAC must restrict pod creation as well as protect privileged resources. The `ops-viewer` role cannot create pods. This test does not establish that the original kindnet-backed profile enforces NetworkPolicies.
-
-**CI kubeconfig and the Minikube CA.** Minikube's kubeconfig points to the CA *file* in the admin user's home directory instead of embedding it. The runner user cannot read it, so kubectl failed with `x509: certificate signed by unknown authority`. Fix: base64-embed the CA into the runner's kubeconfig.
-
-**YAML trap in `.gitlab-ci.yml`.** `- echo "Manifests: $FILES"` is valid YAML, but it parses as a mapping (`{'echo "Manifests': '$FILES"'}`) instead of a string, so GitLab rejected the file and created no jobs (pipelines #9 to #11). Replacing the colon with `=` fixed it. A local `yaml.safe_load` passed the broken file, so it is not a reliable check: use GitLab's Pipeline editor validation instead.
-
-**Configuration drift.** `kubectl set env` changes live state that is not in git. `kubectl rollout undo` plus `kubectl apply -f` brought the cluster back in sync. Git should be the source of truth, and the pipeline enforces that.
-
-**`kubectl port-forward` pins to one pod.** After a rollout replaces the pod, the forward dies. Run it with `nohup` and restart it after deploys.
-
-**SSH through a bastion.** The security-group rule "SSH from the bastion's security group" only matches traffic from the bastion's *private* address, so the jump target must be the instance's private IP.
-
----
-
-## Limitations
-
-- Single node, single replica per service. This is a learning environment, not high availability.
-- Redis uses emptyDir, so carts are lost when its pod restarts.
-- Egress is unrestricted. Three allowed and three denied traffic attempts were tested on a separate Calico-backed profile; enforcement of every policy and the original kindnet-backed profile remains unverified.
-- Images are pinned by tag (v0.10.7), not by digest.
-- No Ingress, TLS or public endpoint by design.
-- The ci-deployer token is a long-lived ServiceAccount token stored in the runner user's kubeconfig. Better: short-lived tokens or a hardened runner.
-- The GitLab Runner is a shell executor, so jobs run directly on the Minikube host.
-
-## Roadmap
-
-- [ ] Jenkins deploy pipeline (SSH to the Minikube host), alongside GitLab CI
-- [ ] Monitoring and alerting: Prometheus, Grafana, Alertmanager (to catch the failure the readiness probe missed)
-- [ ] Centralised logging
-- [ ] Egress NetworkPolicies
-- [ ] Migrate the main Minikube profile to Calico and repeat NetworkPolicy tests for the required traffic paths
-- [ ] Short EKS proof of concept (deferred to a later phase)
-- [ ] Terraform/Ansible for the host setup
-
----
+**Rollback verified**: pods healthy, revision history, running image is the previous good tag
+![Rollback verified](docs/screenshots/08-rollback-verified.png)
 
 ## Running it
 
-Prerequisites: an Ubuntu host with Docker, `kubectl` and `minikube` installed.
+After the cluster exists, one-time setup is done by an admin. Jenkins is deliberately not allowed to do this.
 
-```bash
-# For NetworkPolicy enforcement, create a separate Calico-backed test profile.
-# --cni takes effect when the cluster is created.
-minikube start -p netpol-test --driver=docker --cni=calico --cpus=2 --memory=6144
+```
+eksctl create cluster -f eks-lab.yaml
+aws eks update-kubeconfig --name eks-lab --region ap-southeast-1
 
-# For the main learning cluster (kindnet by default):
-minikube start --driver=docker --cpus=2 --memory=6144
+# let the Jenkins instance role authenticate to the cluster
+aws eks create-access-entry --cluster-name eks-lab --region ap-southeast-1 \
+  --principal-arn arn:aws:iam::<AWS_ACCOUNT_ID>:role/jenkins-ec2-role
 
-# namespace, RBAC, policies and all workloads (files are applied in order)
-kubectl apply -f k8s/
-
-# optional: identity used by CI
-kubectl apply -f bootstrap/ci-deployer.yaml
-
-kubectl get pods -n shopsphere
-
-# open the shop at http://localhost:8080
-kubectl port-forward -n shopsphere --address 127.0.0.1 svc/frontend 8080:80
+kubectl apply -f namespace.yaml
+kubectl apply -f jenkins-deployment-rbac.yaml
+kubectl apply -n boutique -f kubernetes-manifests.yaml
+kubectl scale deployment loadgenerator -n boutique --replicas=0
 ```
 
-On a remote host, add an SSH tunnel from your laptop: `ssh -N -L 8080:localhost:8080 <host>`.
+Then run the Jenkins job with `DEPLOY=true`. To open the shop: `kubectl port-forward -n boutique svc/frontend 8090:80` and visit `http://localhost:8090`.
 
-## Cost notes
+Note: the RoleBinding subject must match the Jenkins instance's assumed-role identity, so update it if the Jenkins instance is replaced.
 
-Instances are stopped between sessions (`minikube stop`, then stop the EC2 instances). No NAT gateway is needed to run this project, because the Minikube host is in a public subnet and GitLab traffic stays on private IPs.
+Before using the files, replace `<AWS_ACCOUNT_ID>` (Jenkinsfile, `jenkins-deployment-rbac.yaml` and the commands above) and `<JENKINS_INSTANCE_ID>` (`jenkins-deployment-rbac.yaml`) with your own values.
+
+## Problems I hit and how I fixed them
+
+| Problem | Cause | Fix |
+|---|---|---|
+| EKS node group stuck in `DELETING` | Auto Scaling Group kept trying to launch a 2nd node and failed (`VcpuLimitExceeded`, 8 vCPU account limit) | Scaled the ASG to 0, then deleted the cluster and VPC in dependency order |
+| `cartservice` stuck `Pending` | 2 vCPU node out of CPU requests | Scaled the load generator to 0 (now a manual step after applying the manifests, because Jenkins is scoped to `frontend` and `cartservice` only) |
+| Jenkins had no internet, and ECR login timed out | Private route table had a blackhole `0.0.0.0/0` route after the NAT Gateway was deleted to save cost | Created a new NAT Gateway and pointed the route at it |
+| `eksctl create cluster` failed with `AlreadyExistsException` | The cluster had been deleted outside CloudFormation, leaving the `eksctl-eks-lab-*` stacks behind | Deleted the stale stacks, then recreated the cluster |
+| Stale stacks could not be deleted | CloudFormation termination protection was enabled on both stacks | Disabled termination protection, then deleted the nodegroup stack and the cluster stack in that order |
+| Cluster stack stuck deleting its VPC | A security group created by EKS itself (not by CloudFormation) was still attached | Confirmed no ENIs, load balancers or gateways remained, deleted that security group, and the stack finished |
+| Jenkins builds stuck "waiting for executor" | Node marked offline: stale low-disk reading after the EBS volume was resized | Grew the volume, restarted Jenkins |
+| Jenkins UI unreachable through the tunnel | Port 8080 not reachable from the bastion | Tunnelled over SSH (port 22) via ProxyJump |
+| `git push` over SSH refused | The SSH tunnel to the git server was not running | Re-opened the tunnel (or pushed over HTTP through the GitLab tunnel) |
+| Jenkinsfile not found | Notepad saved it as `Jenkinsfile.txt` | Renamed the file |
+
+## Cost control
+
+The EKS control plane, node and NAT Gateway are billed hourly, so the cluster is created for each session and deleted afterwards with `eksctl delete cluster --name eks-lab --region ap-southeast-1`. Always delete through eksctl rather than the console, otherwise CloudFormation stacks are left behind. The NAT Gateway and Elastic IP for the Jenkins VPC are separate and are deleted and released at the end of each session. Images stay in ECR, and the whole setup is recreated from the config in about 20 minutes.
+
+## What is automated and what is not
+
+**Automated:** image build, ECR push, deploy to EKS, rollout health check, automatic rollback on failure, least-privilege access for Jenkins.
+
+**Not automated yet:**
+- Builds are started manually from Jenkins; there is no GitLab webhook trigger yet.
+- Only `frontend` and `cartservice` are built by the pipeline; the other services use the stock images.
+- There is no monitoring stack (Prometheus/Grafana) on this cluster.
+
+## Next steps
+
+- GitLab webhook to trigger builds on push
+- Build all services in the pipeline, not just two
+- Image scanning, and Ingress with a load balancer
+- Monitoring with Prometheus and Grafana
+- Rebuild the cluster with Terraform
 
 ## Credits
 
-Application: [GoogleCloudPlatform/microservices-demo](https://github.com/GoogleCloudPlatform/microservices-demo), licensed under Apache 2.0.
+The application is Google's [Online Boutique](https://github.com/GoogleCloudPlatform/microservices-demo) microservices demo, licensed under Apache 2.0. The pipeline, cluster configuration, Kubernetes manifests, RBAC and rollback logic in this repository are my own work.
