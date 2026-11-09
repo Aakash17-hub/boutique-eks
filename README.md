@@ -2,6 +2,9 @@
 
 A hands-on cloud/DevOps project: a self-hosted **GitLab -> Jenkins -> Amazon ECR -> Amazon EKS** pipeline that builds and deploys the Google *Online Boutique* microservices demo, with a least-privilege deploy role and automatic rollback when a rollout fails.
 
+> This pipeline runs inside the AWS lab built in [devops-lab-infra](https://github.com/Aakash17-hub/devops-lab-infra) (VPC, bastion, private-subnet GitLab and Jenkins).
+> The same application also runs on Minikube, with hand-written manifests, RBAC, NetworkPolicies, GitLab CI and Prometheus/Grafana monitoring, in [shopsphere](https://github.com/Aakash17-hub/shopsphere).
+
 ## Architecture
 
 ```
